@@ -1,276 +1,321 @@
-// Find NEAR documentation at https://docs.near.org
-use near_sdk::json_types::U64;
-use near_sdk::{AccountId, NearToken, PanicOnDefault, Promise, Timestamp, env, near, require};
+use near_sdk::store::{IterableMap, IterableSet, Vector};
+use near_sdk::{env, near, require, AccountId, NearToken, PanicOnDefault, Promise};
 
-// Define the contract structure
-#[near(contract_state)]
-#[derive(PanicOnDefault)] // The contract is required to be initialized with `#[init]` functions
-pub struct Contract {
-    highest_bid: Bid,
-    auction_end_time: Timestamp,
-    auctioneer: AccountId,
-    is_claimed: bool,
-}
+const DAY_NS: u64 = 86_400_000_000_000;
+const STORAGE_RESERVE: NearToken = NearToken::from_near(1);
 
-// The Bid structure is used as function return value (JSON-serialized) and as part of the Contract
-// state (Borsh-serialized)
 #[near(serializers = [json, borsh])]
 #[derive(Clone)]
-pub struct Bid {
-    pub bidder: AccountId,
-    pub bid: NearToken,
+pub struct AuditEntry {
+    pub id: u64,
+    pub timestamp_ns: u64,
+    pub agent: AccountId,
+    pub recipient: AccountId,
+    pub amount: NearToken,
+    pub memo: String,
+    /// "paid" | "blocked" | "pending" | "rejected"
+    pub status: String,
+    pub reason: String,
 }
 
-// Implement the contract functions
+#[near(serializers = [json, borsh])]
+#[derive(Clone)]
+pub struct PolicyView {
+    pub owner: AccountId,
+    pub per_tx_cap: NearToken,
+    pub daily_cap: NearToken,
+    pub approval_threshold: NearToken,
+    pub paused: bool,
+    pub spent_today: NearToken,
+}
+
+#[near(contract_state)]
+#[derive(PanicOnDefault)]
+pub struct Guardrail {
+    owner: AccountId,
+    agents: IterableSet<AccountId>,
+    allowlist: IterableSet<AccountId>,
+    per_tx_cap: NearToken,
+    daily_cap: NearToken,
+    approval_threshold: NearToken,
+    paused: bool,
+    spent_day: u64,
+    spent_today: NearToken,
+    log: Vector<AuditEntry>,
+    pending: IterableMap<u64, AuditEntry>,
+}
+
 #[near]
-impl Contract {
-    /// Initializer function that one must call after the contract code is deployed to an account
-    /// for the first time, all other functions will fail to execute until the contract state is
-    /// initialized (thanks to PanicOnDefault derive above).
-    /// It is common to batch contract initialization in the same transaction as contract deployment.
-    /// Sometimes #[private] attribute can also be useful to guard the function to be callable only
-    /// by the account where the contract is deployed to.
+impl Guardrail {
     #[init]
-    pub fn init(end_time: U64, auctioneer: AccountId) -> Self {
+    pub fn new(
+        owner: AccountId,
+        per_tx_cap: NearToken,
+        daily_cap: NearToken,
+        approval_threshold: NearToken,
+    ) -> Self {
         Self {
-            highest_bid: Bid {
-                bidder: env::current_account_id(),
-                bid: NearToken::from_yoctonear(1),
-            },
-            auction_end_time: end_time.into(),
-            is_claimed: false,
-            auctioneer,
+            owner,
+            agents: IterableSet::new(b"a"),
+            allowlist: IterableSet::new(b"w"),
+            per_tx_cap,
+            daily_cap,
+            approval_threshold,
+            paused: false,
+            spent_day: env::block_timestamp() / DAY_NS,
+            spent_today: NearToken::from_yoctonear(0),
+            log: Vector::new(b"l"),
+            pending: IterableMap::new(b"p"),
         }
     }
 
-    /// Bid function can be called by any account on blockchain to make a higher bid on the auction
-    #[payable]
-    pub fn bid(&mut self) -> Promise {
-        // Assert the auction is still ongoing
+    // ---------- owner controls ----------
+
+    pub fn add_agent(&mut self, agent: AccountId) {
+        self.assert_owner();
+        self.agents.insert(agent);
+    }
+
+    pub fn remove_agent(&mut self, agent: AccountId) {
+        self.assert_owner();
+        self.agents.remove(&agent);
+    }
+
+    pub fn allow_recipient(&mut self, recipient: AccountId) {
+        self.assert_owner();
+        self.allowlist.insert(recipient);
+    }
+
+    pub fn remove_recipient(&mut self, recipient: AccountId) {
+        self.assert_owner();
+        self.allowlist.remove(&recipient);
+    }
+
+    pub fn set_policy(
+        &mut self,
+        per_tx_cap: NearToken,
+        daily_cap: NearToken,
+        approval_threshold: NearToken,
+    ) {
+        self.assert_owner();
+        self.per_tx_cap = per_tx_cap;
+        self.daily_cap = daily_cap;
+        self.approval_threshold = approval_threshold;
+    }
+
+    /// Kill switch: halts every agent payment immediately.
+    pub fn pause(&mut self) {
+        self.assert_owner();
+        self.paused = true;
+    }
+
+    pub fn resume(&mut self) {
+        self.assert_owner();
+        self.paused = false;
+    }
+
+    pub fn approve(&mut self, id: u64) -> AuditEntry {
+        self.assert_owner();
+        require!(!self.paused, "Kill switch is active");
+        let p = self
+            .pending
+            .remove(&id)
+            .expect("No pending payment with that id");
+        self.roll_day();
         require!(
-            env::block_timestamp() < self.auction_end_time,
-            "Auction has ended"
+            p.amount.as_yoctonear() <= self.available_balance(),
+            "Insufficient vault balance"
         );
-
-        // Current bid
-        let bid = env::attached_deposit();
-        let bidder = env::predecessor_account_id();
-
-        // Last bid recorded by the contract
-        let Bid {
-            bidder: last_bidder,
-            bid: last_bid,
-        } = self.highest_bid.clone();
-
-        // Check if the deposit is higher than the current bid
-        require!(bid > last_bid, "You must place a higher bid");
-
-        // Update the highest bid
-        self.highest_bid = Bid { bidder, bid };
-
-        // Transfer tokens back to the last bidder.
-        //
-        // NOTE: The result of this Promise is not handled. If this transfer fails (for example,
-        // because `last_bidder` account was removed), the previous bidder may not be refunded even
-        // though `self.highest_bid` has already been updated. For production use, consider
-        // implementing a withdrawal pattern or adding a callback to handle transfer failures.
-        Promise::new(last_bidder).transfer(last_bid)
-    }
-
-    /// Claim function can be called by any account on blockchain to claim the auction and transfer
-    /// the tokens to the auctioneer
-    pub fn claim(&mut self) -> Promise {
-        // Assert the auction has ended
-        require!(
-            env::block_timestamp() > self.auction_end_time,
-            "Auction has not ended yet"
+        self.spent_today = NearToken::from_yoctonear(
+            self.spent_today.as_yoctonear() + p.amount.as_yoctonear(),
         );
-
-        // Assert the auction has not been claimed yet
-        require!(!self.is_claimed, "Auction has already been claimed");
-        self.is_claimed = true;
-
-        // Transfer tokens to the auctioneer.
-        //
-        // NOTE: The result of this Promise is not handled. If this transfer fails (for example,
-        // because `last_bidder` account was removed), the previous bidder may not be refunded even
-        // though `self.highest_bid` has already been updated. For production use, consider
-        // implementing a withdrawal pattern or adding a callback to handle transfer failures.
-        Promise::new(self.auctioneer.clone()).transfer(self.highest_bid.bid)
+        Promise::new(p.recipient.clone()).transfer(p.amount).detach();
+        self.set_status(id, "paid", "approved by owner")
     }
 
-    /*
-     * The functions below are read-only functions that can be called without a transaction (through
-     * JSON RPC query call). They read the data from the contract local storage and return the
-     * highest bid, auction end time, auctioneer, and claimed status
-     */
-
-    pub fn get_highest_bid(&self) -> Bid {
-        self.highest_bid.clone()
+    pub fn reject(&mut self, id: u64) -> AuditEntry {
+        self.assert_owner();
+        self.pending
+            .remove(&id)
+            .expect("No pending payment with that id");
+        self.set_status(id, "rejected", "rejected by owner")
     }
 
-    pub fn get_auction_end_time(&self) -> U64 {
-        self.auction_end_time.into()
+    // ---------- agent entry points ----------
+
+    /// The only way an agent can move money. Never panics on a policy
+    /// violation (a panic would revert the audit log); it returns the verdict.
+    pub fn request_payment(
+        &mut self,
+        recipient: AccountId,
+        amount: NearToken,
+        memo: String,
+    ) -> AuditEntry {
+        let agent = env::predecessor_account_id();
+        require!(self.agents.contains(&agent), "Caller is not a registered agent");
+        self.roll_day();
+
+        match self.check(&recipient, amount) {
+            Err(reason) => self.record(agent, recipient, amount, memo, "blocked", &reason),
+            Ok(true) => {
+                let entry = self.record(
+                    agent,
+                    recipient,
+                    amount,
+                    memo,
+                    "pending",
+                    "above approval threshold, waiting for owner",
+                );
+                self.pending.insert(entry.id, entry.clone());
+                entry
+            }
+            Ok(false) => {
+                self.spent_today = NearToken::from_yoctonear(
+                    self.spent_today.as_yoctonear() + amount.as_yoctonear(),
+                );
+                Promise::new(recipient.clone()).transfer(amount).detach();
+                self.record(agent, recipient, amount, memo, "paid", "within policy")
+            }
+        }
     }
 
-    pub fn get_auctioneer(&self) -> AccountId {
-        self.auctioneer.clone()
+    /// Lets the off-chain scam / prompt-injection check write its blocks
+    /// into the same on-chain audit log.
+    pub fn log_block(
+        &mut self,
+        recipient: AccountId,
+        amount: NearToken,
+        memo: String,
+        reason: String,
+    ) -> AuditEntry {
+        let agent = env::predecessor_account_id();
+        require!(self.agents.contains(&agent), "Caller is not a registered agent");
+        self.record(agent, recipient, amount, memo, "blocked", &reason)
     }
 
-    pub fn is_already_claimed(&self) -> bool {
-        self.is_claimed
+    // ---------- views ----------
+
+    pub fn get_policy(&self) -> PolicyView {
+        PolicyView {
+            owner: self.owner.clone(),
+            per_tx_cap: self.per_tx_cap,
+            daily_cap: self.daily_cap,
+            approval_threshold: self.approval_threshold,
+            paused: self.paused,
+            spent_today: self.spent_today,
+        }
+    }
+
+    pub fn get_log(&self, from_index: u32, limit: u32) -> Vec<AuditEntry> {
+        self.log
+            .iter()
+            .skip(from_index as usize)
+            .take(limit as usize)
+            .cloned()
+            .collect()
+    }
+
+    pub fn get_pending(&self) -> Vec<AuditEntry> {
+        self.pending.values().cloned().collect()
+    }
+
+    pub fn get_allowlist(&self) -> Vec<AccountId> {
+        self.allowlist.iter().cloned().collect()
+    }
+
+    pub fn get_agents(&self) -> Vec<AccountId> {
+        self.agents.iter().cloned().collect()
     }
 }
 
-/*
- * The rest of this file holds the inline tests for the code above
- * Learn more about Rust tests: https://doc.rust-lang.org/book/ch11-01-writing-tests.html
- */
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use near_sdk::json_types::U64;
-    use near_sdk::test_utils::{VMContextBuilder, accounts};
-    use near_sdk::{AccountId, testing_env};
-
-    fn get_context(predecessor_account_id: AccountId) -> VMContextBuilder {
-        let mut builder = VMContextBuilder::new();
-        builder
-            .current_account_id(accounts(0))
-            .signer_account_id(predecessor_account_id.clone())
-            .predecessor_account_id(predecessor_account_id);
-        builder
+// Private helpers (not exposed as contract methods).
+impl Guardrail {
+    fn assert_owner(&self) {
+        require!(
+            env::predecessor_account_id() == self.owner,
+            "Only the owner can call this"
+        );
     }
 
-    #[test]
-    fn init_contract() {
-        let end_time: U64 = U64::from(1000);
-        let alice: AccountId = "alice.near".parse().unwrap();
-        let contract = Contract::init(end_time, alice.clone());
-
-        let default_bid = contract.get_highest_bid();
-        assert_eq!(default_bid.bidder, env::current_account_id());
-        assert_eq!(default_bid.bid, NearToken::from_yoctonear(1));
-
-        let auction_end_time = contract.get_auction_end_time();
-        assert_eq!(auction_end_time, end_time);
-
-        let auctioneer = contract.get_auctioneer();
-        assert_eq!(auctioneer, alice);
-
-        assert!(!contract.is_already_claimed());
+    fn roll_day(&mut self) {
+        let today = env::block_timestamp() / DAY_NS;
+        if today != self.spent_day {
+            self.spent_day = today;
+            self.spent_today = NearToken::from_yoctonear(0);
+        }
     }
 
-    #[test]
-    fn bid_successfully() {
-        let auctioneer: AccountId = "auctioneer.near".parse().unwrap();
-        let alice: AccountId = "alice.near".parse().unwrap();
-        let end_time: U64 = U64::from(1000);
-        let mut contract = Contract::init(end_time, auctioneer.clone());
-
-        // Set block_timestamp before auction end time
-        let mut context = get_context(alice.clone());
-        context.block_timestamp(500);
-        context.attached_deposit(NearToken::from_near(2));
-        testing_env!(context.build());
-
-        // Bid should succeed
-        let _ = contract.bid();
-
-        // Verify highest bid is updated
-        let highest_bid = contract.get_highest_bid();
-        assert_eq!(highest_bid.bidder, alice);
-        assert_eq!(highest_bid.bid, NearToken::from_near(2));
+    fn available_balance(&self) -> u128 {
+        env::account_balance()
+            .as_yoctonear()
+            .saturating_sub(STORAGE_RESERVE.as_yoctonear())
     }
 
-    #[test]
-    #[should_panic(expected = "Auction has ended")]
-    fn bid_after_auction_ended() {
-        let auctioneer: AccountId = "auctioneer.near".parse().unwrap();
-        let alice: AccountId = "alice.near".parse().unwrap();
-        let end_time: U64 = U64::from(1000);
-        let mut contract = Contract::init(end_time, auctioneer.clone());
-
-        // Set block_timestamp after auction end time
-        let mut context = get_context(alice.clone());
-        context.block_timestamp(2000);
-        context.attached_deposit(NearToken::from_near(2));
-        testing_env!(context.build());
-
-        // Bid should panic
-        let _ = contract.bid();
+    /// Ok(true) = allowed but needs owner approval, Ok(false) = allowed now,
+    /// Err(reason) = blocked.
+    fn check(&self, recipient: &AccountId, amount: NearToken) -> Result<bool, String> {
+        if self.paused {
+            return Err("kill switch active: all payments halted".to_string());
+        }
+        if amount.as_yoctonear() == 0 {
+            return Err("amount must be greater than zero".to_string());
+        }
+        if amount > self.per_tx_cap {
+            return Err(format!("exceeds per-transaction cap of {}", self.per_tx_cap));
+        }
+        if !self.allowlist.contains(recipient) {
+            return Err(format!("recipient {} is not on the allowlist", recipient));
+        }
+        let projected = self.spent_today.as_yoctonear() + amount.as_yoctonear();
+        if projected > self.daily_cap.as_yoctonear() {
+            return Err(format!("would exceed daily cap of {}", self.daily_cap));
+        }
+        if amount.as_yoctonear() > self.available_balance() {
+            return Err("insufficient vault balance".to_string());
+        }
+        Ok(amount > self.approval_threshold)
     }
 
-    #[test]
-    #[should_panic(expected = "You must place a higher bid")]
-    fn bid_lower_than_current() {
-        let auctioneer: AccountId = "auctioneer.near".parse().unwrap();
-        let alice: AccountId = "alice.near".parse().unwrap();
-        let end_time: U64 = U64::from(1000);
-        let mut contract = Contract::init(end_time, auctioneer.clone());
-
-        // Set block_timestamp before auction end time
-        let mut context = get_context(alice.clone());
-        context.block_timestamp(500);
-        // Default bid is 1 yoctoNEAR, so bidding with 0 or less should fail
-        // But we'll bid with the same amount (1 yoctoNEAR) which should also fail
-        context.attached_deposit(NearToken::from_yoctonear(1));
-        testing_env!(context.build());
-
-        // Bid should panic
-        let _ = contract.bid();
+    fn record(
+        &mut self,
+        agent: AccountId,
+        recipient: AccountId,
+        amount: NearToken,
+        memo: String,
+        status: &str,
+        reason: &str,
+    ) -> AuditEntry {
+        let entry = AuditEntry {
+            id: self.log.len() as u64,
+            timestamp_ns: env::block_timestamp(),
+            agent,
+            recipient,
+            amount,
+            memo,
+            status: status.to_string(),
+            reason: reason.to_string(),
+        };
+        self.log.push(entry.clone());
+        Self::emit(&entry);
+        entry
     }
 
-    #[test]
-    fn claim_after_auction_ended() {
-        let auctioneer: AccountId = "auctioneer.near".parse().unwrap();
-        let end_time: U64 = U64::from(1000);
-        let mut contract = Contract::init(end_time, auctioneer.clone());
-
-        // Set block_timestamp after auction end time
-        let mut context = get_context(auctioneer.clone());
-        context.block_timestamp(2000);
-        testing_env!(context.build());
-
-        // Claim should succeed
-        let _ = contract.claim();
-
-        // Verify auction is marked as claimed
-        assert!(contract.is_already_claimed());
+    fn set_status(&mut self, id: u64, status: &str, reason: &str) -> AuditEntry {
+        let entry = self
+            .log
+            .get_mut(id as u32)
+            .expect("Log entry missing");
+        entry.status = status.to_string();
+        entry.reason = reason.to_string();
+        let out = entry.clone();
+        Self::emit(&out);
+        out
     }
 
-    #[test]
-    #[should_panic(expected = "Auction has not ended yet")]
-    fn claim_before_auction_ended() {
-        let auctioneer: AccountId = "auctioneer.near".parse().unwrap();
-        let end_time: U64 = U64::from(1000);
-        let mut contract = Contract::init(end_time, auctioneer.clone());
-
-        // Set block_timestamp before auction end time
-        let mut context = get_context(auctioneer.clone());
-        context.block_timestamp(500);
-        testing_env!(context.build());
-
-        // Claim should panic
-        let _ = contract.claim();
-    }
-
-    #[test]
-    #[should_panic(expected = "Auction has already been claimed")]
-    fn claim_twice() {
-        let auctioneer: AccountId = "auctioneer.near".parse().unwrap();
-        let end_time: U64 = U64::from(1000);
-        let mut contract = Contract::init(end_time, auctioneer.clone());
-
-        // Set block_timestamp after auction end time
-        let mut context = get_context(auctioneer.clone());
-        context.block_timestamp(2000);
-        testing_env!(context.build());
-
-        // First claim should succeed
-        let _ = contract.claim();
-
-        // Second claim should panic
-        let _ = contract.claim();
+    fn emit(entry: &AuditEntry) {
+        env::log_str(&format!(
+            "GUARDRAIL_EVENT:{}",
+            near_sdk::serde_json::to_string(entry).unwrap()
+        ));
     }
 }
