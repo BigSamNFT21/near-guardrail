@@ -5,7 +5,8 @@
   "type": "module",
   "scripts": {
     "genkey": "node genkey.mjs",
-    "demo": "node demo.mjs"
+    "demo": "node demo.mjs",
+    "log": "node log.mjs"
   },
   "dependencies": {
     "@anthropic-ai/sdk": "^1.7.0",
